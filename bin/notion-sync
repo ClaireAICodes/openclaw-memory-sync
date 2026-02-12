@@ -1,0 +1,6 @@
+#!/bin/bash
+# OpenClaw Notion Sync Wrapper
+# Usage: openclaw notion-sync [options]
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../scripts" && pwd)"
+python3 "$SCRIPT_DIR/notion_sync.py" "$@"
