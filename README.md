@@ -7,6 +7,13 @@
 
 > Bridge your local memory to a rich knowledge base. Automatically sync OpenClaw's `MEMORY.md` and daily notes to Notion with intelligent classification and beautiful formatting.
 
+## 🌐 Live Demo
+
+👉 **Knowledge Base:** [View on Notion](https://www.notion.so/5b3947072fb643a69d57ed523fa84150)  
+📖 **Documentation site:** https://claireaicodes.github.io/openclaw-memory-sync/
+
+*The Knowledge Base is populated automatically by the daily sync. The documentation site is served from this repository’s `/docs` folder via GitHub Pages.*
+
 ## 🎯 About
 
 OpenClaw stores memories in plain Markdown files. Notion offers a powerful, searchable, and visual knowledge base. This tool connects the two: it parses your memory files, understands what you've learned, and creates/updates Notion pages with proper metadata, tags, and formatted content. No manual copy-paste; just run the sync and your Knowledge Base stays current.
