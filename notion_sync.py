@@ -45,24 +45,36 @@ class NotionClient:
 
     def __init__(self, api_key: str, database_id: str):
         self.api_key = api_key
-        self.database_id = database_id
+        self.database_id = self._format_uuid(database_id)
+
+    def _format_uuid(self, id_str: str) -> str:
+        """Convert a 32-char hex ID to hyphenated UUID format if needed."""
+        if '-' in id_str:
+            return id_str
+        if len(id_str) == 32:
+            return f"{id_str[:8]}-{id_str[8:12]}-{id_str[12:16]}-{id_str[16:20]}-{id_str[20:]}"
+        return id_str
 
     def _curl_request(self, method: str, endpoint: str, data: Dict = None) -> Optional[Dict]:
         """执行curl请求"""
         cmd = [
             "curl", "-s", "-X", method, endpoint,
             "-H", f"Authorization: Bearer {self.api_key}",
-            "-H", "Notion-Version: 2025-09-03",
+            "-H", "Notion-Version: 2022-06-28",
             "-H", "Content-Type: application/json",
         ]
         if data:
             cmd.extend(["-d", json.dumps(data)])
 
         result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            err = result.stderr.strip() if result.stderr else "Unknown error"
+            logger.error(f"curl error (code {result.returncode}): {err}")
+            return None
         try:
             return json.loads(result.stdout)
         except json.JSONDecodeError:
-            logger.error(f"JSON decode error: {result.stdout[:300]}")
+            logger.error(f"JSON decode error: stdout={result.stdout[:500]}, stderr={result.stderr[:500]}")
             return None
 
     def create_page(self, properties: Dict, children: List[Dict] = None) -> Optional[str]:
@@ -90,7 +102,7 @@ class NotionClient:
         return resp and resp.get("object") == "page"
 
     def query_by_source_file(self, source_file: str) -> Optional[str]:
-        """根据Source_File查找页面"""
+        """根据Source_File查找页面 (deprecated - using local state instead)"""
         query = {
             "filter": {
                 "property": "Source File",
@@ -101,6 +113,46 @@ class NotionClient:
         if resp and resp.get("results"):
             return resp["results"][0].get("id")
         return None
+
+    def archive_page(self, page_id: str) -> bool:
+        """Archive (delete) a page by setting archived=True."""
+        payload = {"archived": True}
+        resp = self._curl_request("PATCH", f"https://api.notion.com/v1/pages/{page_id}", payload)
+        if resp and resp.get("object") == "page":
+            logger.info(f"✅ Archived page: {page_id}")
+            return True
+        else:
+            err_msg = resp.get('message', 'Unknown error') if resp else 'No response'
+            logger.error(f"❌ Failed to archive page {page_id}: {err_msg}")
+            return False
+
+    def list_all_pages(self) -> List[Dict]:
+        """List all pages in the database."""
+        pages = []
+        cursor = None
+        logger.debug(f"Querying database {self.database_id} for all pages")
+        while True:
+            payload = {"page_size": 100}
+            if cursor:
+                payload["start_cursor"] = cursor
+            resp = self._curl_request("POST", f"https://api.notion.com/v1/databases/{self.database_id}/query", payload)
+            if resp is None:
+                logger.error("No response from query (resp is None)")
+                break
+            if not isinstance(resp, dict):
+                logger.error(f"Invalid response type: {type(resp)}")
+                break
+            if resp.get("object") == "error":
+                logger.error(f"Notion API error: {resp.get('code')} - {resp.get('message')}")
+                break
+            results = resp.get("results", [])
+            logger.debug(f"Query returned {len(results)} pages in this batch")
+            pages.extend(results)
+            if not resp.get("has_more"):
+                break
+            cursor = resp.get("next_cursor")
+        logger.info(f"Total pages retrieved: {len(pages)}")
+        return pages
 
 
 class MemoryParser:
@@ -231,7 +283,7 @@ class MemoryParser:
         all_entries.extend(self.parse_memory_file())
         all_entries.extend(self.parse_daily_files(days_back))
 
-        # 去重（基于标题+内容哈希）
+        # 去重（基于标题+内容哈希）并附加content_hash
         seen = set()
         unique_entries = []
         for entry in all_entries:
@@ -240,6 +292,7 @@ class MemoryParser:
             ).hexdigest()[:16]
             if content_hash not in seen:
                 seen.add(content_hash)
+                entry['content_hash'] = content_hash
                 unique_entries.append(entry)
 
         logger.info(f"Total unique knowledge entries: {len(unique_entries)}")
@@ -518,6 +571,28 @@ class SyncOrchestrator:
         self.classifier = classifier
         self.converter = converter
         self.sync_log_path = WORKSPACE / 'memory' / 'sync-log.md'
+        self.state_path = WORKSPACE / 'memory' / 'notion-sync-state.json'
+        self.state = self.load_state()
+
+    def load_state(self) -> Dict[str, str]:
+        """Load sync state from file (maps content_hash -> page_id)"""
+        if self.state_path.exists():
+            try:
+                with open(self.state_path, 'r') as f:
+                    state = json.load(f)
+                if isinstance(state, dict):
+                    return state
+            except Exception as e:
+                logger.warning(f"Failed to load state file: {e}")
+        return {}
+
+    def save_state(self):
+        """Save sync state to file"""
+        try:
+            with open(self.state_path, 'w') as f:
+                json.dump(self.state, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}")
 
     def log_action(self, action: str, details: str):
         """记录同步操作"""
@@ -526,6 +601,34 @@ class SyncOrchestrator:
         with open(self.sync_log_path, 'a') as f:
             f.write(log_entry)
         logger.info(f"📝 {action}: {details}")
+
+    def cleanup_orphans(self, dry_run: bool = False):
+        """Archive (remove) pages not in sync state."""
+        logger.info("🔍 Scanning for orphan pages...")
+        all_pages = self.notion.list_all_pages()
+        all_page_ids = {p.get("id") for p in all_pages if p.get("id")}
+        state_page_ids = set(self.state.values())
+        orphan_ids = all_page_ids - state_page_ids
+
+        logger.info(f"Database contains {len(all_page_ids)} pages")
+        logger.info(f"State tracks {len(state_page_ids)} pages")
+        logger.info(f"Found {len(orphan_ids)} orphan pages to archive")
+
+        if dry_run:
+            logger.info("DRY-RUN: would archive these pages:")
+            for pid in orphan_ids:
+                logger.info(f"  - {pid}")
+            return
+
+        for pid in orphan_ids:
+            try:
+                if self.notion.archive_page(pid):
+                    self.log_action("ARCHIVED_ORPHAN", f"page {pid}")
+                else:
+                    self.log_action("ARCHIVE_FAILED", f"page {pid}")
+            except Exception as e:
+                logger.error(f"Error archiving page {pid}: {e}")
+                self.log_action("ARCHIVE_ERROR", f"page {pid}: {e}")
 
     def _truncate_text(self, text: str, max_len: int) -> str:
         """智能截断文本，尽量在句子边界截断"""
@@ -544,7 +647,21 @@ class SyncOrchestrator:
         entry = self.classifier.classify(entry)
         meta = entry['metadata']
         source_file = entry.get('file', 'unknown')
-        existing_page_id = self.notion.query_by_source_file(source_file)
+        content_hash = entry.get('content_hash')
+        if not content_hash:
+            # Fallback: compute hash
+            content_hash = hashlib.md5(
+                f"{entry['title']}|{entry.get('date', '')}|{entry['body'][:200]}".encode()
+            ).hexdigest()[:16]
+
+        # Check state: already synced?
+        if content_hash in self.state:
+            existing_page_id = self.state[content_hash]
+            if dry_run:
+                logger.info(f"SKIP (already synced): {entry['title']} (page: {existing_page_id})")
+            else:
+                logger.info(f"SKIP (already synced): {entry['title']} (page: {existing_page_id})")
+            return existing_page_id
 
         # 构建属性 - 使用空格名称
         properties = {
@@ -573,7 +690,7 @@ class SyncOrchestrator:
             children = self.converter.convert(body_content)
 
         if dry_run:
-            self.log_action("DRY-RUN", f"Would {'update' if existing_page_id else 'create'}: {entry['title']}")
+            self.log_action("DRY-RUN", f"Would create: {entry['title']}")
             logger.info(f"[DRY-RUN] Title: {entry['title']}")
             logger.info(f"  Type: {meta['content_type']}, Domain: {meta['domain']}")
             logger.info(f"  Confidence: {meta['confidence_score']}, Impact: {meta['impact']}")
@@ -582,21 +699,16 @@ class SyncOrchestrator:
             logger.info(f"  Children: {len(children) if children else 0} blocks")
             return None
 
-        if existing_page_id:
-            success = self.notion.update_page(existing_page_id, properties=properties)
-            if success:
-                self.log_action("UPDATED", f"{entry['title']} (page: {existing_page_id})")
-                return existing_page_id
-            else:
-                self.log_action("UPDATE_FAILED", f"{entry['title']}")
-                return None
-        else:
-            page_id = self.notion.create_page(properties, children=children)
-            if page_id:
-                self.log_action("CREATED", f"{entry['title']} (page: {page_id})")
-            else:
-                self.log_action("CREATE_FAILED", f"{entry['title']}")
+        page_id = self.notion.create_page(properties, children=children)
+        if page_id:
+            self.log_action("CREATED", f"{entry['title']} (page: {page_id})")
+            # Record in state
+            self.state[content_hash] = page_id
+            self.save_state()
             return page_id
+        else:
+            self.log_action("CREATE_FAILED", f"{entry['title']}")
+            return None
 
     def sync(self, days_back: int = 7, dry_run: bool = False, limit: int = None):
         logger.info("=" * 60)
@@ -636,6 +748,7 @@ def main():
     parser_cli.add_argument('--verbose', action='store_true', help='Show debug logs')
     parser_cli.add_argument('--since', type=str, help='Only sync entries since YYYY-MM-DD')
     parser_cli.add_argument('--limit', type=int, help='Limit number of entries to process')
+    parser_cli.add_argument('--cleanup', action='store_true', help='Cleanup orphan pages not in sync state')
     args = parser_cli.parse_args()
 
     if args.verbose:
@@ -663,7 +776,11 @@ def main():
             return 1
 
     orchestrator = SyncOrchestrator(notion, memory_parser, classifier, converter)
-    orchestrator.sync(days_back=days_back, dry_run=args.dry_run, limit=args.limit)
+
+    if args.cleanup:
+        orchestrator.cleanup_orphans(dry_run=args.dry_run)
+    else:
+        orchestrator.sync(days_back=days_back, dry_run=args.dry_run, limit=args.limit)
 
     return 0
 
