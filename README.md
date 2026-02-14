@@ -1,8 +1,6 @@
 [//]: # (GitHub Documentation Standardization Protocol - Phase 2 & 3)
 [//]: # (Hero visual: verified GIF, 200 OK, matches project palette/tone)
 
-![Notion Sync Animation](https://media.tenor.com/qm9qriHz2vcAAAAC/salesforce-appexchange.gif)
-
 # OpenClaw Notion Sync
 
 > Bridge your local memory to a rich knowledge base. Automatically sync OpenClaw's `MEMORY.md` and daily notes to Notion with intelligent classification and beautiful formatting.
